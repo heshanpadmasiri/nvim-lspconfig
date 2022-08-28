@@ -1,14 +1,16 @@
 local util = require 'lspconfig.util'
 
 local bin_name = 'vscode-json-language-server'
+local cmd = { bin_name, '--stdio' }
+
 if vim.fn.has 'win32' == 1 then
-  bin_name = bin_name .. '.cmd'
+  cmd = { 'cmd.exe', '/C', bin_name, '--stdio' }
 end
 
 return {
   default_config = {
-    cmd = { bin_name, '--stdio' },
-    filetypes = { 'json' },
+    cmd = cmd,
+    filetypes = { 'json', 'jsonc' },
     init_options = {
       provideFormatter = true,
     },
@@ -17,7 +19,6 @@ return {
   },
   docs = {
     -- this language server config is in VSCode built-in package.json
-    package_json = 'https://raw.githubusercontent.com/microsoft/vscode/master/extensions/json-language-features/package.json',
     description = [[
 https://github.com/hrsh7th/vscode-langservers-extracted
 
