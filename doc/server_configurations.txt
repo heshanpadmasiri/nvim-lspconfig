@@ -660,7 +660,7 @@ require'lspconfig'.ballerina.setup{}
 **Default values:**
   - `cmd` : 
   ```lua
-  { "bal" }
+  { "bal", "start-language-server" }
   ```
   - `filetypes` : 
   ```lua
