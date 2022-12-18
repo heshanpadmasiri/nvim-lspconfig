@@ -1,5 +1,4 @@
-local api = vim.api
-local configs = require 'lspconfig.configs'
+local api, fn, lsp = vim.api, vim.fn, vim.lsp
 local windows = require 'lspconfig.ui.windows'
 local util = require 'lspconfig.util'
 
@@ -37,17 +36,26 @@ local function remove_newlines(cmd)
   return cmd
 end
 
+local cmd_type = {
+  ['function'] = function(_)
+    return '<function>', 'NA'
+  end,
+  ['table'] = function(config)
+    local cmd = remove_newlines(config.cmd)
+    if vim.fn.executable(config.cmd[1]) == 1 then
+      return cmd, 'true'
+    end
+    return cmd, error_messages.cmd_not_found
+  end,
+}
+
 local function make_config_info(config, bufnr)
   local config_info = {}
   config_info.name = config.name
   config_info.helptags = {}
+
   if config.cmd then
-    config_info.cmd = remove_newlines(config.cmd)
-    if vim.fn.executable(config.cmd[1]) == 1 then
-      config_info.cmd_is_executable = 'true'
-    else
-      config_info.cmd_is_executable = error_messages.cmd_not_found
-    end
+    config_info.cmd, config_info.cmd_is_executable = cmd_type[type(config.cmd)](config)
   else
     config_info.cmd = 'cmd not defined'
     config_info.cmd_is_executable = 'NA'
@@ -56,19 +64,12 @@ local function make_config_info(config, bufnr)
   local buffer_dir = api.nvim_buf_call(bufnr, function()
     return vim.fn.expand '%:p:h'
   end)
-  local root_dir = config.get_root_dir(buffer_dir)
+  local root_dir = config.get_root_dir and config.get_root_dir(buffer_dir)
   if root_dir then
     config_info.root_dir = root_dir
   else
     config_info.root_dir = error_messages.root_dir_not_found
     vim.list_extend(config_info.helptags, helptags[error_messages.root_dir_not_found])
-    local root_dir_pattern = vim.tbl_get(config, 'document_config', 'docs', 'default_config', 'root_dir')
-    if root_dir_pattern then
-      config_info.root_dir = config_info.root_dir
-        .. ' Searched for: '
-        .. remove_newlines(vim.split(root_dir_pattern, '\n'))
-        .. '.'
-    end
   end
 
   config_info.autostart = (config.autostart and 'true') or 'false'
@@ -102,13 +103,39 @@ local function make_config_info(config, bufnr)
   return lines
 end
 
-local function make_client_info(client)
+---@param client table
+---@param fname string
+local function make_client_info(client, fname)
   local client_info = {}
 
-  client_info.cmd = remove_newlines(client.config.cmd)
-  if client.workspaceFolders then
-    client_info.root_dir = client.workspaceFolders[1].name
-  else
+  client_info.cmd = cmd_type[type(client.config.cmd)](client.config)
+  local workspace_folders = fn.has 'nvim-0.9' == 1 and client.workspace_folders or client.workspaceFolders
+  local uv = vim.loop
+  local is_windows = uv.os_uname().version:match 'Windows'
+  fname = vim.fn.fnamemodify(vim.fn.resolve(fname), ':p')
+  local sep = is_windows and '\\' or '/'
+  local fname_parts = vim.split(fname, sep, { trimempty = true })
+  if workspace_folders then
+    for _, schema in pairs(workspace_folders) do
+      local matched = true
+      local root = uv.fs_realpath(schema.name)
+      local root_parts = vim.split(root, sep, { trimempty = true })
+
+      for i = 1, #root_parts do
+        if root_parts[i] ~= fname_parts[i] then
+          matched = false
+          break
+        end
+      end
+
+      if matched then
+        client_info.root_dir = schema.name
+        break
+      end
+    end
+  end
+
+  if not client_info.root_dir then
     client_info.root_dir = 'Running in single file mode.'
   end
   client_info.filetypes = table.concat(client.config.filetypes or {}, ', ')
@@ -121,8 +148,6 @@ local function make_client_info(client)
       .. client.name
       .. ' (id: '
       .. tostring(client.id)
-      .. ', pid: '
-      .. tostring(client.rpc.pid)
       .. ', bufnr: ['
       .. client_info.attached_buffers_list
       .. '])',
@@ -148,10 +173,11 @@ end
 return function()
   -- These options need to be cached before switching to the floating
   -- buffer.
-  local buf_clients = vim.lsp.buf_get_clients()
-  local clients = vim.lsp.get_active_clients()
-  local buffer_filetype = vim.bo.filetype
   local original_bufnr = api.nvim_get_current_buf()
+  local buf_clients = lsp.get_active_clients { bufnr = original_bufnr }
+  local clients = lsp.get_active_clients()
+  local buffer_filetype = vim.bo.filetype
+  local fname = api.nvim_buf_get_name(original_bufnr)
 
   windows.default_options.wrap = true
   windows.default_options.breakindent = true
@@ -192,7 +218,7 @@ return function()
 
   vim.list_extend(buf_lines, buffer_clients_header)
   for _, client in pairs(buf_clients) do
-    local client_info = make_client_info(client)
+    local client_info = make_client_info(client, fname)
     vim.list_extend(buf_lines, client_info)
   end
 
@@ -204,7 +230,7 @@ return function()
     vim.list_extend(buf_lines, other_active_section_header)
   end
   for _, client in pairs(other_active_clients) do
-    local client_info = make_client_info(client)
+    local client_info = make_client_info(client, fname)
     vim.list_extend(buf_lines, client_info)
   end
 
@@ -269,17 +295,15 @@ return function()
       .. error_messages.root_dir_not_found
   )
 
-  vim.cmd 'let m=matchadd("string", "true")'
-  vim.cmd 'let m=matchadd("error", "false")'
-  for _, config in pairs(configs) do
-    vim.fn.matchadd('LspInfoTitle', '\\%(Client\\|Config\\):.*\\zs' .. config.name .. '\\ze')
-    vim.fn.matchadd('LspInfoList', 'list:.*\\zs' .. config.name .. '\\ze')
-    if config.filetypes then
-      for _, ft in pairs(config.filetypes) do
-        vim.fn.matchadd('LspInfoFiletype', '\\%(filetypes\\|filetype\\):.*\\zs' .. ft .. '\\ze')
-      end
-    end
-  end
+  vim.cmd [[
+    syn keyword String true
+    syn keyword Error false
+    syn match LspInfoFiletypeList /\<filetypes\?:\s*\zs.*\ze/ contains=LspInfoFiletype
+    syn match LspInfoFiletype /\k\+/ contained
+    syn match LspInfoTitle /^\s*\%(Client\|Config\):\s*\zs\k\+\ze/
+    syn match LspInfoListList /^\s*Configured servers list:\s*\zs.*\ze/ contains=LspInfoList
+    syn match LspInfoList /\k\+/ contained
+  ]]
 
   api.nvim_buf_add_highlight(bufnr, 0, 'LspInfoTip', 0, 0, -1)
 end
