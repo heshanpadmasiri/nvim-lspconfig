@@ -4,6 +4,8 @@ local api = vim.api
 local lsp = vim.lsp
 local uv = vim.loop
 
+local is_windows = uv.os_uname().version:match 'Windows'
+
 local M = {}
 
 M.default_config = {
@@ -94,8 +96,6 @@ end
 
 -- Some path utilities
 M.path = (function()
-  local is_windows = uv.os_uname().version:match 'Windows'
-
   local function escape_wildcards(path)
     return path:gsub('([%[%]%?%*])', '\\%1')
   end
@@ -227,6 +227,20 @@ M.path = (function()
   }
 end)()
 
+local function check_in_workspace(client, root_dir)
+  if not client.workspace_folders then
+    return false
+  end
+
+  for _, dir in ipairs(client.workspace_folders) do
+    if (root_dir .. '/'):sub(1, #dir.name + 1) == dir.name .. '/' then
+      return true
+    end
+  end
+
+  return false
+end
+
 -- Returns a function(root_dir), which, when called with a root_dir it hasn't
 -- seen before, will call make_config(root_dir) and start a new client.
 function M.server_per_root_dir_manager(make_config)
@@ -237,103 +251,61 @@ function M.server_per_root_dir_manager(make_config)
   function manager.add(root_dir, single_file, bufnr)
     root_dir = M.path.sanitize(root_dir)
 
-    local client_id_iterator = function(client_ids, conf)
-      for _, id in ipairs(client_ids) do
+    local function get_client_from_cache(client_name)
+      if vim.tbl_count(clients) == 0 then
+        return
+      end
+
+      if clients[root_dir] then
+        for _, id in pairs(clients[root_dir]) do
+          local client = lsp.get_client_by_id(id)
+          if client and client.name == client_name then
+            return client
+          end
+        end
+      end
+
+      local all_client_ids = {}
+      vim.tbl_map(function(val)
+        vim.list_extend(all_client_ids, { unpack(val) })
+      end, clients)
+
+      for _, id in ipairs(all_client_ids) do
         local client = lsp.get_client_by_id(id)
-        if client and client.name == conf.name then
+        if client and client.name == client_name then
           return client
         end
       end
     end
 
-    local register_to_clients = function(id)
-      if not clients[root_dir] then
-        clients[root_dir] = {}
+    local function attach_and_cache(root, client_id)
+      lsp.buf_attach_client(bufnr, client_id)
+      if not clients[root] then
+        clients[root] = {}
       end
-      if not vim.tbl_contains(clients[root_dir], id) then
-        table.insert(clients[root_dir], id)
+      if not vim.tbl_contains(clients[root], client_id) then
+        clients[root][#clients[root] + 1] = client_id
       end
-    end
-
-    -- get client which support workspace from clients table
-    local get_client_from_cache = function(conf)
-      if vim.tbl_count(clients) == 0 then
-        return
-      end
-      local client
-
-      if clients[root_dir] then
-        client = client_id_iterator(clients[root_dir], conf)
-      else
-        for _, ids in pairs(clients) do
-          client = client_id_iterator(ids, conf)
-          if client then
-            break
-          end
-        end
-      end
-
-      return client
     end
 
     local new_config = make_config(root_dir)
-    local client = get_client_from_cache(new_config)
 
-    --TODO(glepnir): do we need check language server support the workspaceFOlders?
-    --some server support it but the it not show in server_capabilities
-    local register_workspace_folders = function(client_instance)
+    local function register_workspace_folders(client)
       local params = {
         event = {
           added = { { uri = vim.uri_from_fname(root_dir), name = root_dir } },
           removed = {},
         },
       }
-      for _, schema in ipairs(client_instance.workspace_folders or {}) do
-        if schema.name == root_dir then
-          return
-        end
+      client.rpc.notify('workspace/didChangeWorkspaceFolders', params)
+      if not client.workspace_folders then
+        client.workspace_folders = {}
       end
-      client_instance.rpc.notify('workspace/didChangeWorkspaceFolders', params)
-      if not client_instance.workspace_folders then
-        client_instance.workspace_folders = {}
-      end
-      table.insert(client_instance.workspace_folders, params.event.added[1])
+      client.workspace_folders[#client.workspace_folders + 1] = params.event.added[1]
+      attach_and_cache(root_dir, client.id)
     end
 
-    local attach_after_client_initialized = function(client_instance)
-      local timer = vim.loop.new_timer()
-      timer:start(
-        0,
-        10,
-        vim.schedule_wrap(function()
-          if client_instance.initialized and not timer:is_closing() then
-            lsp.buf_attach_client(bufnr, client_instance.id)
-            if not single_file then
-              register_workspace_folders(client_instance)
-            end
-            register_to_clients(client_instance.id)
-            timer:stop()
-            timer:close()
-          end
-        end)
-      )
-    end
-
-    if client then
-      if client.initialized then
-        lsp.buf_attach_client(bufnr, client.id)
-        if not single_file then
-          register_workspace_folders(client)
-        end
-        register_to_clients(client.id)
-      else
-        attach_after_client_initialized(client)
-      end
-      return
-    end
-
-    local client_id
-    local start_new_client = function()
+    local function start_new_client()
       -- do nothing if the client is not enabled
       if new_config.enabled == false then
         return
@@ -349,9 +321,10 @@ function M.server_per_root_dir_manager(make_config)
         return
       end
       new_config.on_exit = M.add_hook_before(new_config.on_exit, function()
-        for k, v in pairs(clients[root_dir]) do
-          if v == client_id then
-            table.remove(clients[root_dir], k)
+        for index, id in pairs(clients[root_dir]) do
+          local exist = lsp.get_client_by_id(id)
+          if exist.name == new_config.name then
+            table.remove(clients[root_dir], index)
           end
         end
       end)
@@ -369,28 +342,67 @@ function M.server_per_root_dir_manager(make_config)
         new_config.root_dir = nil
         new_config.workspace_folders = nil
       end
-      client_id = lsp.start_client(new_config)
+      local client_id = lsp.start_client(new_config)
+      if not client_id then
+        return
+      end
+      attach_and_cache(root_dir, client_id)
     end
 
-    if not client then
+    local function attach_or_spawn(client)
+      if check_in_workspace(client, root_dir) then
+        return attach_and_cache(root_dir, client.id)
+      end
+
+      local supported = vim.tbl_get(client, 'server_capabilities', 'workspace', 'workspaceFolders', 'supported')
+      if supported then
+        return register_workspace_folders(client)
+      end
       start_new_client()
     end
 
-    if not client_id then
+    local attach_after_client_initialized = function(client)
+      local timer = vim.loop.new_timer()
+      timer:start(
+        0,
+        10,
+        vim.schedule_wrap(function()
+          if client.initialized and client.server_capabilities and not timer:is_closing() then
+            attach_or_spawn(client)
+            timer:stop()
+            timer:close()
+          end
+        end)
+      )
+    end
+
+    local client = get_client_from_cache(new_config.name)
+
+    if not client then
+      return start_new_client()
+    end
+
+    if clients[root_dir] or single_file then
+      lsp.buf_attach_client(bufnr, client.id)
       return
     end
 
-    lsp.buf_attach_client(bufnr, client_id)
-    register_to_clients(client_id)
+    -- make sure neovim had exchanged capabilities from language server
+    -- it's useful to check server support workspaceFolders or not
+    if client.initialized and client.server_capabilities then
+      attach_or_spawn(client)
+    else
+      attach_after_client_initialized(client)
+    end
   end
 
   function manager.clients()
     local res = {}
     for _, client_ids in pairs(clients) do
-      for _, id in pairs(client_ids) do
+      for _, id in ipairs(client_ids) do
         local client = lsp.get_client_by_id(id)
         if client then
-          table.insert(res, client)
+          res[#res + 1] = client
         end
       end
     end
@@ -464,6 +476,23 @@ function M.find_package_json_ancestor(startpath)
       return path
     end
   end)
+end
+
+function M.insert_package_json(config_files, field, fname)
+  local path = vim.fn.fnamemodify(fname, ':h')
+  local root_with_package = M.find_package_json_ancestor(path)
+
+  if root_with_package then
+    -- only add package.json if it contains field parameter
+    local path_sep = is_windows and '\\' or '/'
+    for line in io.lines(root_with_package .. path_sep .. 'package.json') do
+      if line:find(field) then
+        config_files[#config_files + 1] = 'package.json'
+        break
+      end
+    end
+  end
+  return config_files
 end
 
 function M.get_active_clients_list_by_ft(filetype)

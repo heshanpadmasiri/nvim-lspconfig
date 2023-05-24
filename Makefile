@@ -1,5 +1,5 @@
 test:
-	sh ./scripts/run_test.sh
+	vusted ./test
 
 lint:
 	@printf "\nRunning luacheck\n"
@@ -10,9 +10,3 @@ lint:
 	stylua --check .
 
 .PHONY: test lint
-
-luarocks_upload:
-	bash ./scripts/luarocks-upload.sh
-
-test_luarocks_install:
-	bash ./scripts/test-luarocks-install.sh
